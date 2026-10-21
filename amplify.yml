@@ -1,0 +1,22 @@
+version: 1
+applications:
+  - appRoot: ui
+    frontend:
+      # Install from the repository root so npm links @feedback/contracts.
+      buildPath: /
+      phases:
+        preBuild:
+          commands:
+            - nvm install 24
+            - nvm use 24
+            - npm ci --include=dev --cache .npm --prefer-offline
+        build:
+          commands:
+            - npm run build -w ui
+      artifacts:
+        baseDirectory: ui/dist
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - .npm/**/*
