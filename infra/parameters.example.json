@@ -1,0 +1,25 @@
+[
+  {
+    "ParameterKey": "BucketName",
+    "ParameterValue": "your-unique-branchlight-feedback"
+  },
+  {
+    "ParameterKey": "ArtifactBucket",
+    "ParameterValue": "your-existing-artifact-bucket"
+  },
+  {
+    "ParameterKey": "ArtifactKey",
+    "ParameterValue": "branchlight/worker-RELEASE.zip"
+  },
+  { "ParameterKey": "CodeSha256", "ParameterValue": "BASE64_SHA256_OF_ZIP" },
+  { "ParameterKey": "SubnetIds", "ParameterValue": "subnet-aaaa,subnet-bbbb" },
+  { "ParameterKey": "SecurityGroupIds", "ParameterValue": "sg-aaaa" },
+  {
+    "ParameterKey": "BedrockModelId",
+    "ParameterValue": "YOUR_ENABLED_CONVERSE_MODEL_OR_PROFILE_ID"
+  },
+  {
+    "ParameterKey": "BedrockResourceArns",
+    "ParameterValue": "arn:aws:bedrock:REGION::foundation-model/MODEL_ID"
+  }
+]

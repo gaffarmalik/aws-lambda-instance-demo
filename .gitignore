@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.demo-data/
+playwright-report/
+test-results/
+.DS_Store
+infra/parameters.local.json
+retry-event.json

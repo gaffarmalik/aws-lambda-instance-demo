@@ -1,0 +1,445 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Branchlight demo: S3 batches invoke a published Lambda Managed Instances worker. Express stays local.",
+  "Parameters": {
+    "BucketName": {
+      "Type": "String",
+      "Description": "Globally unique NEW feedback bucket name",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+    },
+    "ArtifactBucket": {
+      "Type": "String",
+      "Description": "Existing deployment artifact bucket in this region"
+    },
+    "ArtifactKey": {
+      "Type": "String",
+      "Description": "Unique key of the worker zip; change for every release"
+    },
+    "CodeSha256": {
+      "Type": "String",
+      "Description": "Base64 SHA256 of the worker zip (used to publish a fresh version)"
+    },
+    "SubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Subnets in one VPC with AWS service connectivity; use multiple AZs"
+    },
+    "SecurityGroupIds": {
+      "Type": "List<AWS::EC2::SecurityGroup::Id>",
+      "Description": "Security groups in the same VPC; permit required outbound HTTPS"
+    },
+    "BedrockModelId": {
+      "Type": "String",
+      "Description": "Enabled Converse model ID or inference profile ID"
+    },
+    "BedrockResourceArns": {
+      "Type": "CommaDelimitedList",
+      "Description": "Exact model ARNs, plus inference-profile and destination model ARNs if using a cross-region profile"
+    },
+    "MaxVCpuCount": {
+      "Type": "Number",
+      "Default": 24,
+      "MinValue": 8,
+      "Description": "Capacity limit; managed EC2 instances incur charges while provisioned"
+    }
+  },
+  "Resources": {
+    "OperatorRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AWSLambdaManagedEC2ResourceOperator"
+          }
+        ]
+      }
+    },
+    "CapacityProvider": {
+      "Type": "AWS::Lambda::CapacityProvider",
+      "Properties": {
+        "VpcConfig": {
+          "SubnetIds": {
+            "Ref": "SubnetIds"
+          },
+          "SecurityGroupIds": {
+            "Ref": "SecurityGroupIds"
+          }
+        },
+        "PermissionsConfig": {
+          "CapacityProviderOperatorRoleArn": {
+            "Fn::GetAtt": ["OperatorRole", "Arn"]
+          }
+        },
+        "InstanceRequirements": {
+          "Architectures": ["x86_64"]
+        },
+        "CapacityProviderScalingConfig": {
+          "ScalingMode": "Auto",
+          "MaxVCpuCount": {
+            "Ref": "MaxVCpuCount"
+          }
+        }
+      }
+    },
+    "FailureQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "MessageRetentionPeriod": 1209600,
+        "SqsManagedSseEnabled": true
+      }
+    },
+    "WorkerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "BatchProcessing",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:ListBucket"],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:GetObject"],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/batches/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/status/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/processed/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:PutObject"],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/status/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/processed/*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["bedrock:InvokeModel"],
+                  "Resource": {
+                    "Ref": "BedrockResourceArns"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["sqs:SendMessage"],
+                  "Resource": {
+                    "Fn::GetAtt": ["FailureQueue", "Arn"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Worker": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Description": "Separate batch worker: classification, aggregation, transformation",
+        "Runtime": "nodejs22.x",
+        "Handler": "index.handler",
+        "Architectures": ["x86_64"],
+        "MemorySize": 2048,
+        "Timeout": 900,
+        "Role": {
+          "Fn::GetAtt": ["WorkerRole", "Arn"]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ArtifactBucket"
+          },
+          "S3Key": {
+            "Ref": "ArtifactKey"
+          }
+        },
+        "CapacityProviderConfig": {
+          "LambdaManagedInstancesCapacityProviderConfig": {
+            "CapacityProviderArn": {
+              "Fn::GetAtt": ["CapacityProvider", "Arn"]
+            },
+            "ExecutionEnvironmentMemoryGiBPerVCpu": 4,
+            "PerExecutionEnvironmentMaxConcurrency": 4
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "DEMO_MODE": "aws",
+            "S3_BUCKET": {
+              "Ref": "BucketName"
+            },
+            "BEDROCK_MODEL_ID": {
+              "Ref": "BedrockModelId"
+            },
+            "MODEL_REQUEST_SIZE": "10"
+          }
+        },
+        "DeadLetterConfig": {
+          "TargetArn": {
+            "Fn::GetAtt": ["FailureQueue", "Arn"]
+          }
+        }
+      }
+    },
+    "WorkerVersion": {
+      "Type": "AWS::Lambda::Version",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Worker"
+        },
+        "CodeSha256": {
+          "Ref": "CodeSha256"
+        }
+      }
+    },
+    "WorkerAlias": {
+      "Type": "AWS::Lambda::Alias",
+      "Properties": {
+        "Name": "live",
+        "FunctionName": {
+          "Ref": "Worker"
+        },
+        "FunctionVersion": {
+          "Fn::GetAtt": ["WorkerVersion", "Version"]
+        }
+      }
+    },
+    "AsyncRetries": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Worker"
+        },
+        "Qualifier": "live",
+        "MaximumRetryAttempts": 2,
+        "MaximumEventAgeInSeconds": 21600
+      },
+      "DependsOn": "WorkerAlias"
+    },
+    "S3InvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "WorkerAlias"
+        },
+        "Principal": "s3.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}"
+        }
+      }
+    },
+    "FeedbackBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DependsOn": "S3InvokePermission",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketName": {
+          "Ref": "BucketName"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "NotificationConfiguration": {
+          "LambdaConfigurations": [
+            {
+              "Event": "s3:ObjectCreated:*",
+              "Function": {
+                "Ref": "WorkerAlias"
+              },
+              "Filter": {
+                "S3Key": {
+                  "Rules": [
+                    {
+                      "Name": "prefix",
+                      "Value": "batches/"
+                    },
+                    {
+                      "Name": "suffix",
+                      "Value": ".json"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "BucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "FeedbackBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "CollectorPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Description": "Attach to the local workshop operator role, never to the browser",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket"],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject"],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/batches/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/status/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/processed/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/reports/*"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["s3:PutObject"],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/batches/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${BucketName}/reports/*"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["bedrock:InvokeModel"],
+              "Resource": {
+                "Ref": "BedrockResourceArns"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "Bucket": {
+      "Value": {
+        "Ref": "FeedbackBucket"
+      }
+    },
+    "WorkerAliasArn": {
+      "Value": {
+        "Ref": "WorkerAlias"
+      }
+    },
+    "CapacityProviderArn": {
+      "Value": {
+        "Fn::GetAtt": ["CapacityProvider", "Arn"]
+      }
+    },
+    "CollectorPolicyArn": {
+      "Value": {
+        "Ref": "CollectorPolicy"
+      }
+    },
+    "FailureQueueUrl": {
+      "Value": {
+        "Ref": "FailureQueue"
+      }
+    }
+  }
+}
